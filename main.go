@@ -14,10 +14,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/schollz/progressbar/v3"
 	excelize "github.com/xuri/excelize/v2"
 	"go.uber.org/zap"
 	cli "gopkg.in/urfave/cli.v1"
@@ -40,8 +40,6 @@ const (
 	</html>`
 
 	configFileName = "config.cfg"
-
-	maxDownloadThreads = 5
 )
 
 func NewLogger() (*zap.Logger, error) {
@@ -63,7 +61,6 @@ type SortlyParserConfig struct {
 	Logger   *zap.Logger
 
 	SaveConfig bool
-	Threads    int64
 }
 
 func NewSortlyParserConfig(logger *zap.Logger) *SortlyParserConfig {
@@ -91,7 +88,7 @@ func (spc *SortlyParserConfig) ParseInput(c *cli.Context) error {
 		}
 
 		if _, err := os.Stat(rootFolder); errors.Is(err, os.ErrNotExist) {
-			spc.Logger.Error("root folder does not exist")
+			errR = errors.New("root folder does not exist")
 		}
 
 		spc.RootFolder = rootFolder
@@ -119,17 +116,6 @@ func (spc *SortlyParserConfig) ParseInput(c *cli.Context) error {
 	if saveConfig == "1" {
 		spc.SaveConfig = true
 	}
-
-	thr := c.GlobalString("threads")
-	threads, err := strconv.ParseInt(thr, 10, 32)
-	if err != nil || threads == 0 {
-		spc.Logger.Error(
-			fmt.Sprintf("can not parse threads value, using default, reason: %v", err),
-		)
-		threads = maxDownloadThreads
-	}
-
-	spc.Threads = threads
 
 	return errR
 }
@@ -208,11 +194,11 @@ type Parser struct {
 
 	currRow int
 
+	ImageCount int
+
 	downloadedItems int32
 
-	downloadCh chan struct{}
-
-	wg sync.WaitGroup
+	pbar *progressbar.ProgressBar
 
 	FolderList []*Folder
 }
@@ -241,15 +227,11 @@ func NewSortlyParser(spc *SortlyParserConfig) *SortlyParser {
 
 func (sp *SortlyParser) CreateParser() *Parser {
 	return &Parser{
-		Cfg:        sp.Cfg,
-		downloadCh: make(chan struct{}, sp.Cfg.Threads),
+		Cfg: sp.Cfg,
 	}
 }
 
 func (sp *Parser) ReadExcel() {
-	fmt.Println()
-	sp.Cfg.Logger.Info("Excel parse started")
-
 	f, err := excelize.OpenFile(sp.Cfg.FilePath)
 	if err != nil {
 		sp.Cfg.Logger.Error("can not open file")
@@ -284,7 +266,6 @@ func (sp *Parser) ReadExcel() {
 	sp.Cfg.Logger.Info("Excel parse done")
 	fmt.Println()
 
-	sp.Cfg.Logger.Info("Images parse started")
 	sp.ParseAllItems(sp.FolderList)
 
 	fmt.Println()
@@ -374,6 +355,8 @@ func (sp *Parser) GetUrls() []string {
 		urls = append(urls, photoURL)
 	}
 
+	sp.ImageCount += len(urls)
+
 	return urls
 }
 
@@ -398,32 +381,25 @@ func (sp *Parser) ParseAllItems(folderList []*Folder) {
 	}
 
 	for _, f := range folderList {
-		sp.downloadCh <- struct{}{}
-		sp.wg.Add(1)
-		go sp.Save(f.Item, f)
+		sp.Save(f.Item, f)
 
 		for _, i := range f.ItemList {
-			sp.downloadCh <- struct{}{}
-			sp.wg.Add(1)
-			go sp.Save(i, f)
+			sp.Save(i, f)
 		}
 
 		sp.ParseAllItems(f.FolderList)
-	}
 
-	sp.wg.Wait()
+	}
 }
 
-func (sp *Parser) Save(item *Item, folder *Folder) {
-	atomic.AddInt32(&sp.downloadedItems, 1)
-
-	data := md5.Sum([]byte(item.Name + time.Now().String()))
+func (sp *Parser) Save(img *Item, folder *Folder) {
+	data := md5.Sum([]byte(img.Name + time.Now().String()))
 	hash := hex.EncodeToString(data[:2])
 
 	pictureFolder := fmt.Sprintf("%s%s", sp.Cfg.RootFolder, folder.Path)
 
-	for i := 1; i <= len(item.Url); i++ {
-		pictureFilename := fmt.Sprintf("%s photo(%d)%s.jpg", item.Name, i, hash)
+	for i := 1; i <= len(img.Url); i++ {
+		pictureFilename := fmt.Sprintf("%s photo(%d)%s.jpg", img.Name, i, hash)
 
 		_, err := os.Stat(pictureFolder)
 		if errors.Is(err, os.ErrNotExist) {
@@ -442,32 +418,25 @@ func (sp *Parser) Save(item *Item, folder *Folder) {
 
 		_, err = os.Stat(pictureFolder + pictureFilename)
 		if errors.Is(err, os.ErrNotExist) {
-			err := sp.SaveFileFromURL(item.Url[i-1], pictureFilename, pictureFolder)
+			err := sp.SaveFileFromURL(img.Url[i-1], pictureFilename, pictureFolder)
 			if err != nil {
 				sp.Cfg.Logger.Error(
 					fmt.Sprintf("saving picture from url, reason: %v", err),
 				)
 			}
-
-			sp.Cfg.Logger.Info(
-				fmt.Sprintf(`picture "%s" download complete`, pictureFilename),
-			)
 		}
 
 		if !errors.Is(err, os.ErrNotExist) && err != nil {
 			sp.Cfg.Logger.Error(
-				fmt.Sprintf(`picture "%s" local check before saving, reason: %v`, item.Url[i], err),
+				fmt.Sprintf(`picture "%s" local check before saving, reason: %v`, img.Url[i], err),
 			)
 
 			break
 		}
 
-		nameCell, _ := excelize.CoordinatesToCellName(9+i, item.Row)
-		sp.excelFileNew.SetCellValue("Sheet1", nameCell, sp.Cfg.RootLinks+folder.Path+item.Name+" photo("+strconv.Itoa(i)+")"+hash+".jpg")
+		nameCell, _ := excelize.CoordinatesToCellName(9+i, img.Row)
+		sp.excelFileNew.SetCellValue("Sheet1", nameCell, sp.Cfg.RootLinks+folder.Path+img.Name+" photo("+strconv.Itoa(i)+")"+hash+".jpg")
 	}
-
-	<-sp.downloadCh
-	sp.wg.Done()
 }
 
 func (sp *Parser) SaveFileFromURL(url string, filename string, dir string) error {
@@ -476,13 +445,40 @@ func (sp *Parser) SaveFileFromURL(url string, filename string, dir string) error
 		return err
 	}
 
+	bar := progressbar.NewOptions64(resp.ContentLength,
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetWidth(10),
+		progressbar.OptionThrottle(65*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(os.Stderr, "\n")
+		}),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionFullWidth(),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "[green]=[reset]",
+			SaucerHead:    "[green]>[reset]",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+
+	barDescription := fmt.Sprintf(`[cyan][%d/%d][reset] Downloading "%s"...`, sp.downloadedItems+1, sp.ImageCount, filename)
+	bar.Describe(barDescription)
+
 	file := fmt.Sprintf("%s/%s", dir, filename)
 	f, _ := os.OpenFile(file, os.O_CREATE|os.O_WRONLY, 0777)
 
-	io.Copy(f, resp.Body)
+	io.Copy(io.MultiWriter(f, bar), resp.Body)
 	if err != nil {
 		return err
 	}
+
+	atomic.AddInt32(&sp.downloadedItems, 1)
 
 	return nil
 }
@@ -664,11 +660,6 @@ func (sp *SortlyParser) GetUserInput() error {
 			Value: "",
 			Usage: "Сохранить конфигурацию в файл для работы без параметров командной строки. 1 чтобы сохранить",
 		},
-		cli.StringFlag{
-			Name:  "threads, t",
-			Value: strconv.Itoa(maxDownloadThreads),
-			Usage: "Количество потоков для одновременной скачки",
-		},
 	}
 
 	app.Action = func(c *cli.Context) {
@@ -678,6 +669,9 @@ func (sp *SortlyParser) GetUserInput() error {
 	}
 
 	app.Run(os.Args)
+
+	fmt.Printf("CONFIG %+v\n", sp.Cfg)
+	fmt.Printf("SP %+v\n", sp)
 
 	return errFunc()
 }
@@ -705,6 +699,7 @@ func main() {
 	}
 
 	errUserInput := sp.GetUserInput()
+	fmt.Printf("USER IUNPUT: %v", errUserInput)
 
 	if errUserInput != nil && err != nil {
 		logger.Error(
