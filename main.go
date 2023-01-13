@@ -3,28 +3,529 @@ package main
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	_ "image/jpeg"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	excelize "github.com/xuri/excelize/v2"
+	"go.uber.org/zap"
 	cli "gopkg.in/urfave/cli.v1"
 )
 
-const ()
+const (
+	DEFAULT_SERVICE_PORT = "8080"
 
-// Port of this service
-var wPort string = "8080"
-var rootFolder string = ""
-var rootLinks string = ""
+	htmlPage = `<!DOCTYPE html>
+	<html lang="en">
+	  <head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<meta http-eqgo builuiv="X-UA-Compatible" content="ie=edge" />
+		<title>Document</title>
+	  </head>
+	  <body>
 
-func uploadFile(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("File Upload Endpoint Hit")
+	  </body>
+	</html>`
+
+	configFileName = "config.cfg"
+
+	maxDownloadThreads = 5
+)
+
+func NewLogger() (*zap.Logger, error) {
+	cfg := zap.NewProductionConfig()
+	cfg.OutputPaths = []string{
+		"./logs.log",
+		"stderr",
+	}
+
+	return cfg.Build()
+}
+
+type SortlyParserConfig struct {
+	Port       string `json:"port"`
+	RootFolder string `json:"root_folder"`
+	RootLinks  string `json:"root_links"`
+
+	FilePath string `json:"file_path"`
+	Logger   *zap.Logger
+
+	SaveConfig bool
+	Threads    int64
+}
+
+func NewSortlyParserConfig(logger *zap.Logger) *SortlyParserConfig {
+	return &SortlyParserConfig{
+		Logger: logger,
+	}
+}
+
+func (spc *SortlyParserConfig) ParseInput(c *cli.Context) error {
+	var errR error
+
+	portRe := regexp.MustCompile(`(?m)^[1-9][0-9]{1,4}$`)
+	newPort := portRe.FindString(c.GlobalString("port"))
+	if newPort == "" {
+		errR = errors.New("bad port input")
+	}
+
+	spc.Port = newPort
+
+	rootFolder := c.GlobalString("dir")
+	if rootFolder != "" {
+		rootFolder = strings.Replace(rootFolder, "\\", "/", -1)
+		if rootFolder[len(rootFolder)-1] != '/' {
+			rootFolder += "/"
+		}
+
+		if _, err := os.Stat(rootFolder); errors.Is(err, os.ErrNotExist) {
+			spc.Logger.Error("root folder does not exist")
+		}
+
+		spc.RootFolder = rootFolder
+	}
+
+	rootLinks := c.GlobalString("links")
+	if rootLinks != "" && rootLinks[len(rootLinks)-1] != '/' {
+		rootLinks += "/"
+
+		spc.RootLinks = rootLinks
+	}
+
+	filePath := c.GlobalString("file")
+	if filePath != "" {
+		filePath = strings.Replace(filePath, "\\", "/", -1)
+
+		if _, err := os.Stat(filePath); errors.Is(err, os.ErrNotExist) {
+			errR = errors.New("file does not exist")
+		}
+
+		spc.FilePath = filePath
+	}
+
+	saveConfig := c.GlobalString("cfg")
+	if saveConfig == "1" {
+		spc.SaveConfig = true
+	}
+
+	thr := c.GlobalString("threads")
+	threads, err := strconv.ParseInt(thr, 10, 32)
+	if err != nil || threads == 0 {
+		spc.Logger.Error(
+			fmt.Sprintf("can not parse threads value, using default, reason: %v", err),
+		)
+		threads = maxDownloadThreads
+	}
+
+	spc.Threads = threads
+
+	return errR
+}
+
+func (spc *SortlyParserConfig) ReadConfig() error {
+	_, err := os.Stat(configFileName)
+	if errors.Is(err, os.ErrNotExist) {
+		return os.ErrNotExist
+	}
+
+	if !errors.Is(err, os.ErrNotExist) && err != nil {
+		return fmt.Errorf("can not check file, reason: %v", err)
+	}
+
+	f, err := os.Open(configFileName)
+	if err != nil {
+		return fmt.Errorf("can not open file, reason: %v", err)
+	}
+
+	newSpc := &SortlyParserConfig{}
+
+	err = json.NewDecoder(f).Decode(newSpc)
+	if err != nil {
+		return fmt.Errorf("can not decoding, reason: %v", err)
+	}
+
+	if newSpc.Port == "" {
+		return errors.New("config port is empty, bad config")
+	}
+
+	if newSpc.RootFolder == "" {
+		return errors.New("root folder is empty, bad config")
+	}
+
+	if newSpc.RootLinks == "" {
+		return errors.New("root links is empty, bad config")
+	}
+
+	spc.Port = newSpc.Port
+	spc.RootFolder = newSpc.RootFolder
+	spc.RootLinks = newSpc.RootLinks
+
+	return nil
+}
+
+func (spc *SortlyParserConfig) WriteConfig() {
+	f, err := os.Create("config.cfg")
+	if err != nil {
+		spc.Logger.Error(
+			fmt.Sprintf("can not open file to write config, reason: %v", err),
+		)
+	}
+
+	configStr := fmt.Sprintf("{\n\t%s%s%s\n\t%s%s%s\n\t%s%s%s\n}",
+		`"port":"`, spc.Port, `",`,
+		`"root_folder":"`, spc.RootFolder, `",`,
+		`"root_links":"`, spc.RootLinks, `"`)
+
+	_, err = f.WriteString(configStr)
+	if err != nil {
+		spc.Logger.Error(
+			fmt.Sprintf("can not write config to file, reason: %v", err),
+		)
+	}
+}
+
+type SortlyParser struct {
+	Cfg *SortlyParserConfig
+}
+
+type Parser struct {
+	Cfg *SortlyParserConfig
+
+	excelFileOrig *excelize.File
+	excelFileNew  *excelize.File
+
+	currRow int
+
+	downloadedItems int32
+
+	downloadCh chan struct{}
+
+	wg sync.WaitGroup
+
+	FolderList []*Folder
+}
+
+type Folder struct {
+	Name string
+	Item *Item
+	Path string
+
+	FolderList []*Folder
+	ItemList   []*Item
+}
+
+type Item struct {
+	Name string
+	Url  []string
+
+	Row int
+}
+
+func NewSortlyParser(spc *SortlyParserConfig) *SortlyParser {
+	return &SortlyParser{
+		Cfg: spc,
+	}
+}
+
+func (sp *SortlyParser) CreateParser() *Parser {
+	return &Parser{
+		Cfg:        sp.Cfg,
+		downloadCh: make(chan struct{}, sp.Cfg.Threads),
+	}
+}
+
+func (sp *Parser) ReadExcel() {
+	fmt.Println()
+	sp.Cfg.Logger.Info("Excel parse started")
+
+	f, err := excelize.OpenFile(sp.Cfg.FilePath)
+	if err != nil {
+		sp.Cfg.Logger.Error("can not open file")
+	}
+
+	sp.excelFileOrig = f
+	sp.excelFileNew = f
+
+	sp.currRow = 2
+	for {
+		nameCell, _ := excelize.CoordinatesToCellName(1, sp.currRow)
+		entryName, err := f.GetCellValue("Sheet1", nameCell)
+		if err != nil {
+			sp.Cfg.Logger.Error("cant read Entry Name cell")
+		}
+
+		if entryName == "" {
+			break
+		}
+
+		nameCell, _ = excelize.CoordinatesToCellName(2, sp.currRow)
+		entryType, _ := f.GetCellValue("Sheet1", nameCell)
+
+		_ = entryType
+
+		sp.AddItem(entryType, entryName)
+
+		sp.currRow++
+	}
+
+	fmt.Println()
+	sp.Cfg.Logger.Info("Excel parse done")
+	fmt.Println()
+
+	sp.Cfg.Logger.Info("Images parse started")
+	sp.ParseAllItems(sp.FolderList)
+
+	fmt.Println()
+	sp.Cfg.Logger.Info("Images parse done")
+	fmt.Println()
+
+	sp.SaveExcelFile()
+
+	fmt.Println()
+	sp.Cfg.Logger.Info("Sortly parsing work is done!")
+	fmt.Println()
+}
+
+func (sp *Parser) AddItem(entryType, entryName string) {
+	var (
+		rootFolder *Folder
+		path       = ""
+	)
+
+	for i := 5; i < 10; i++ {
+		nameCell, _ := excelize.CoordinatesToCellName(i, sp.currRow)
+		folderName, _ := sp.excelFileOrig.GetCellValue("Sheet1", nameCell)
+
+		if folderName == "" {
+			if i == 5 && entryType == "Folder" {
+				sp.FolderList = append(sp.FolderList, &Folder{
+					Name: entryName,
+					Item: &Item{
+						Name: entryName,
+						Url:  sp.GetUrls(),
+						Row:  sp.currRow,
+					},
+					Path: fmt.Sprintf("%s/", entryName),
+				})
+
+				break
+			}
+
+			break
+		}
+
+		for _, f := range sp.FolderList {
+			rootFolder = GetFolderByName(f, folderName)
+			path += fmt.Sprintf("%s/", rootFolder.Name)
+		}
+
+	}
+
+	if rootFolder != nil {
+		path += fmt.Sprintf("%s/", entryName)
+
+		switch entryType {
+		case "Folder":
+			{
+				rootFolder.FolderList = append(rootFolder.FolderList, &Folder{
+					Name: entryName,
+					Item: &Item{
+						Name: entryName,
+						Url:  sp.GetUrls(),
+						Row:  sp.currRow,
+					},
+					Path: path,
+				})
+			}
+		case "Item":
+			{
+				rootFolder.ItemList = append(rootFolder.ItemList, &Item{
+					Name: entryName,
+					Url:  sp.GetUrls(),
+					Row:  sp.currRow,
+				})
+			}
+		}
+
+	}
+}
+
+func (sp *Parser) GetUrls() []string {
+	urls := make([]string, 0, 3)
+
+	for column := 10; column < 13; column++ {
+		nameCell, _ := excelize.CoordinatesToCellName(column, sp.currRow)
+		photoURL, _ := sp.excelFileOrig.GetCellValue("Sheet1", nameCell)
+		if photoURL == "" {
+			break
+		}
+		urls = append(urls, photoURL)
+	}
+
+	return urls
+}
+
+func GetFolderByName(rootFolder *Folder, name string) *Folder {
+	if rootFolder.Name == name {
+		return rootFolder
+	}
+
+	for _, f := range rootFolder.FolderList {
+		folderR := GetFolderByName(f, name)
+		if folderR != nil {
+			return folderR
+		}
+	}
+
+	return nil
+}
+
+func (sp *Parser) ParseAllItems(folderList []*Folder) {
+	if folderList == nil {
+		return
+	}
+
+	for _, f := range folderList {
+		sp.downloadCh <- struct{}{}
+		sp.wg.Add(1)
+		go sp.Save(f.Item, f)
+
+		for _, i := range f.ItemList {
+			sp.downloadCh <- struct{}{}
+			sp.wg.Add(1)
+			go sp.Save(i, f)
+		}
+
+		sp.ParseAllItems(f.FolderList)
+	}
+
+	sp.wg.Wait()
+}
+
+func (sp *Parser) Save(item *Item, folder *Folder) {
+	atomic.AddInt32(&sp.downloadedItems, 1)
+
+	data := md5.Sum([]byte(item.Name + time.Now().String()))
+	hash := hex.EncodeToString(data[:2])
+
+	pictureFolder := fmt.Sprintf("%s%s", sp.Cfg.RootFolder, folder.Path)
+
+	for i := 1; i <= len(item.Url); i++ {
+		pictureFilename := fmt.Sprintf("%s photo(%d)%s.jpg", item.Name, i, hash)
+
+		_, err := os.Stat(pictureFolder)
+		if errors.Is(err, os.ErrNotExist) {
+			mrdirErr := os.MkdirAll(pictureFolder, 0777)
+			if mrdirErr != nil {
+				sp.Cfg.Logger.Error(
+					fmt.Sprintf("cannot create directory for folder, reason:%s", err),
+				)
+
+				continue
+			}
+
+			sp.Cfg.Logger.Info("Directory created: %s\n" + pictureFolder)
+			fmt.Println()
+		}
+
+		_, err = os.Stat(pictureFolder + pictureFilename)
+		if errors.Is(err, os.ErrNotExist) {
+			err := sp.SaveFileFromURL(item.Url[i-1], pictureFilename, pictureFolder)
+			if err != nil {
+				sp.Cfg.Logger.Error(
+					fmt.Sprintf("saving picture from url, reason: %v", err),
+				)
+			}
+
+			sp.Cfg.Logger.Info(
+				fmt.Sprintf(`picture "%s" download complete`, pictureFilename),
+			)
+		}
+
+		if !errors.Is(err, os.ErrNotExist) && err != nil {
+			sp.Cfg.Logger.Error(
+				fmt.Sprintf(`picture "%s" local check before saving, reason: %v`, item.Url[i], err),
+			)
+
+			break
+		}
+
+		nameCell, _ := excelize.CoordinatesToCellName(9+i, item.Row)
+		sp.excelFileNew.SetCellValue("Sheet1", nameCell, sp.Cfg.RootLinks+folder.Path+item.Name+" photo("+strconv.Itoa(i)+")"+hash+".jpg")
+	}
+
+	<-sp.downloadCh
+	sp.wg.Done()
+}
+
+func (sp *Parser) SaveFileFromURL(url string, filename string, dir string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+
+	file := fmt.Sprintf("%s/%s", dir, filename)
+	f, _ := os.OpenFile(file, os.O_CREATE|os.O_WRONLY, 0777)
+
+	io.Copy(f, resp.Body)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (sp *Parser) SaveExcelFile() {
+	excelFolder := fmt.Sprintf("%sexcel", sp.Cfg.RootFolder)
+	_, err := os.Stat(excelFolder)
+	if errors.Is(err, os.ErrNotExist) {
+		mrdirErr := os.MkdirAll(excelFolder, 0777)
+		if mrdirErr != nil {
+			sp.Cfg.Logger.Error(
+				fmt.Sprintf("Error: cannot create directory for excel folder, reason:%s", err),
+			)
+
+			return
+		}
+	}
+
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		sp.Cfg.Logger.Error(
+			fmt.Sprintf("excel folder local check, reason %v", err),
+		)
+
+		return
+	}
+
+	sp.Cfg.Logger.Info("Directory created " + sp.Cfg.RootFolder + "excel")
+	fmt.Println()
+
+	err = sp.excelFileNew.SaveAs(sp.Cfg.RootFolder + "excel/" + sp.FolderList[0].Name + ".xlsx")
+	if err != nil {
+		sp.Cfg.Logger.Error(
+			fmt.Sprintf("saving resulting excel, reason %v", err),
+		)
+
+		return
+	}
+
+	sp.Cfg.Logger.Info("Excel file formed " + sp.Cfg.RootFolder + "excel/" + sp.FolderList[0].Name + ".xlsx")
+}
+
+func (sp *SortlyParser) UploadFile(w http.ResponseWriter, r *http.Request) {
+	sp.Cfg.Logger.Info("File Upload Endpoint Hit")
 
 	// Parse our multipart form, 10 << 20 specifies a maximum
 	// upload of 10 MB files.
@@ -34,169 +535,113 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 	// the Header and the size of the file
 	file, handler, err := r.FormFile("myFile")
 	if err != nil {
-		fmt.Println("Error Retrieving the File")
-		fmt.Printf("Error: %s", err)
+		sp.Cfg.Logger.Error(
+			fmt.Sprintf("retrieving the file, reason %v", err),
+		)
+
 		return
 	}
 	defer file.Close()
-	fmt.Printf("Uploaded File: %+v\n", handler.Filename)
-	fmt.Printf("File Size: %+v\n", handler.Size)
-	fmt.Printf("MIME Header: %+v\n", handler.Header)
 
-	// read all of the contents of our uploaded file into a
-	// byte array
+	sp.Cfg.Logger.Info(
+		fmt.Sprintf("Uploaded File: %+v\n", handler.Filename),
+	)
+	sp.Cfg.Logger.Info(
+		fmt.Sprintf("File Size: %+v\n", handler.Size),
+	)
+	sp.Cfg.Logger.Info(
+		fmt.Sprintf("MIME Header: %+v\n", handler.Header),
+	)
+
 	fileBytes, err := io.ReadAll(file)
 	if err != nil {
-		fmt.Printf("Error: %s", err)
-	}
-	// write this byte array to our temporary file
+		sp.Cfg.Logger.Error(
+			fmt.Sprintf("read uploading file bytes: %s", err),
+		)
 
-	if _, err := os.Stat(rootFolder + "temp-files"); err != nil {
-		if err := os.MkdirAll("temp-files", 0777); err != nil {
-			fmt.Printf("Error: %s", err)
-		} else {
-			fmt.Println("Directory created /temp-files")
-		}
-	}
-
-	if err := os.WriteFile("temp-files/"+handler.Filename, fileBytes, 0777); err != nil {
-		fmt.Printf("Error: %s", err)
-	}
-
-	// return that we have successfully uploaded our file!
-	fmt.Fprintf(w, "Successfully Uploaded File\nWait for a pictures loading\n")
-	go readExcel("temp-files/" + handler.Filename)
-}
-
-func readExcel(filename string) {
-	fileNameExcel := ""
-	f, err := excelize.OpenFile(filename)
-	if err != nil {
-		log.Fatal(err)
-	}
-	newExcel := f
-
-	row := 2
-	for {
-		nameCell, _ := excelize.CoordinatesToCellName(1, row)
-		entryName, err := f.GetCellValue("Sheet1", nameCell)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if entryName == "" {
-			break
-		}
-		nameCell, _ = excelize.CoordinatesToCellName(2, row)
-		entryType, _ := f.GetCellValue("Sheet1", nameCell)
-		folder := getExcelFolder(f, row)
-		if entryType == "Folder" {
-			if folder == "/" {
-				folder = ""
-			}
-			if _, err := os.Stat(rootFolder + folder + entryName); err != nil {
-				if err := os.MkdirAll(rootFolder+folder+entryName, 0777); err != nil {
-					fmt.Printf("Error: %s", err)
-				} else {
-					fmt.Println("Directory created " + rootFolder + folder + entryName)
-				}
-			}
-		}
-		for column := 10; column < 13; column++ {
-			nameCell, _ := excelize.CoordinatesToCellName(column, row)
-			photoURL, _ := f.GetCellValue("Sheet1", nameCell)
-			if photoURL != "" {
-				if folder == "" {
-					folder = entryName + "/"
-					fileNameExcel = entryName
-				}
-				data := md5.Sum([]byte(entryName + time.Now().String()))
-				hash := hex.EncodeToString(data[:])
-				if _, err := os.Stat(rootFolder + folder + entryName + " photo(" + strconv.Itoa(column-9) + ")" + hash + ".jpg"); err != nil {
-					saveFileFromURL(photoURL, entryName+" photo("+strconv.Itoa(column-9)+")"+hash+".jpg", rootFolder+folder)
-				}
-				newExcel.SetCellValue("Sheet1", nameCell, rootLinks+folder+entryName+" photo("+strconv.Itoa(column-9)+")"+hash+".jpg")
-			}
-		}
-		row++
-	}
-
-	if _, err := os.Stat(rootFolder + "excel"); err != nil {
-		if err := os.MkdirAll(rootFolder+"excel", 0777); err != nil {
-			fmt.Printf("Error: %s", err)
-		} else {
-			fmt.Println("Directory created " + rootFolder + "excel")
-		}
-	}
-	if err := newExcel.SaveAs(rootFolder + "excel/" + fileNameExcel + ".xlsx"); err != nil {
-		log.Fatal(err)
-	} else {
-		fmt.Println("Excel file formed " + rootFolder + "excel/" + fileNameExcel + ".xlsx")
-	}
-}
-
-func getExcelFolder(f *excelize.File, row int) string {
-	folder := ""
-	for i := 5; i < 10; i++ {
-		nameCell, _ := excelize.CoordinatesToCellName(i, row)
-		folderPart, _ := f.GetCellValue("Sheet1", nameCell)
-		folder += folderPart + "/"
-		folder = strings.Replace(folder, "//", "/", -1)
-	}
-	return folder
-}
-
-func saveFileFromURL(url string, filename string, dir string) {
-	resp, err := http.Get(url)
-	if err != nil {
-		fmt.Printf("Error: %s", err)
 		return
 	}
-	defer resp.Body.Close()
-	if body, err := io.ReadAll(resp.Body); err != nil {
-		fmt.Printf("Error: %s", err)
-	} else {
-		if err := os.WriteFile(dir+"/"+filename, body, 0777); err != nil {
-			fmt.Printf("Error: %s", err)
-		} else {
-			fmt.Println("OK File " + rootFolder + dir + filename)
-		}
-	}
-}
 
-type Page struct {
-	Title string
-	Body  []byte
-}
-
-func loadPage(title string) (*Page, error) {
-	filename := title + ".html"
-	body, err := os.ReadFile(filename)
+	_, err = os.Stat(sp.Cfg.RootFolder + "temp-files")
 	if err != nil {
-		return nil, err
+		err := os.MkdirAll("temp-files", 0777)
+		if err != nil {
+			sp.Cfg.Logger.Error(
+				fmt.Sprintf("checking folder for uploading files: %s", err),
+			)
+
+			return
+		}
+
+		sp.Cfg.Logger.Info("Directory created /temp-files")
 	}
-	return &Page{Title: "Upload your file here", Body: body}, nil
+
+	err = os.WriteFile("temp-files/"+handler.Filename, fileBytes, 0777)
+	if err != nil {
+		sp.Cfg.Logger.Error(
+			fmt.Sprintf("writing uploading file: %s", err),
+		)
+	}
+
+	sp.Cfg.Logger.Info("Successfully upload file")
+	fmt.Fprintf(w, "Successfully Uploaded File\nWait for a pictures loading\n")
+
+	sp.Cfg.FilePath = fmt.Sprintf("temp-files/%s", handler.Filename)
+
+	parser := sp.CreateParser()
+	go parser.ReadExcel()
 }
 
-func viewHandler(w http.ResponseWriter, r *http.Request) {
-	p, _ := loadPage("uploadFile")
-	fmt.Fprintf(w, "<h1>%s</h1><div>%s</div>", p.Title, p.Body)
+func (sp *SortlyParser) ViewHandler(w http.ResponseWriter, r *http.Request) {
+	title := "Upload your file here"
+	body := []byte(
+		fmt.Sprintf(`<form
+		enctype="multipart/form-data"
+		action="http://localhost:%s/upload"
+		method="post"
+	  >
+		<input type="file" name="myFile" />
+		<input type="submit" value="upload" />
+	  </form>`,
+			sp.Cfg.Port),
+	)
+
+	fmt.Fprintf(w, "<h1>%s</h1><div>%s</div>", title, body)
 }
 
-func setupRoutes() {
-	http.HandleFunc("/upload", uploadFile)
-	http.HandleFunc("/", viewHandler)
-	log.Fatal(http.ListenAndServe(":"+wPort, nil))
+func (sp *SortlyParser) ServerRun() {
+	http.HandleFunc("/upload", sp.UploadFile)
+	http.HandleFunc("/", sp.ViewHandler)
+
+	log.Fatal(http.ListenAndServe(
+		fmt.Sprintf(":%s", sp.Cfg.Port),
+		nil),
+	)
 }
 
-func main() {
+func (sp *SortlyParser) GetUserInput() error {
+	var (
+		rootFolder string = ""
+		rootLinks  string = ""
+
+		errorWraper = func(anyErr error) func() error {
+			err := anyErr
+
+			return func() error {
+				return err
+			}
+		}
+		errFunc func() error
+	)
+
 	app := cli.NewApp()
 	app.Name = "sortly_excel_parser"
-	app.Version = "1.0.0"
+	app.Version = "1.1.0"
 	app.Usage = "Парсит картинки из эксель файлов формата сортли и создает новый эксель файл со ссылками на картинки."
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:  "port,p",
-			Value: wPort,
+			Value: DEFAULT_SERVICE_PORT,
 			Usage: "Порт веб сервиса, на котором хостится веб страница загрузки",
 		},
 		cli.StringFlag{
@@ -214,38 +659,96 @@ func main() {
 			Value: "",
 			Usage: "Директория к файлу, чтобы обработать без хоста",
 		},
+		cli.StringFlag{
+			Name:  "cfg",
+			Value: "",
+			Usage: "Сохранить конфигурацию в файл для работы без параметров командной строки. 1 чтобы сохранить",
+		},
+		cli.StringFlag{
+			Name:  "threads, t",
+			Value: strconv.Itoa(maxDownloadThreads),
+			Usage: "Количество потоков для одновременной скачки",
+		},
 	}
+
 	app.Action = func(c *cli.Context) {
-		wPort = c.GlobalString("port")
-		rootFolder = c.GlobalString("dir")
-		if rootFolder != "" {
-			rootFolder = strings.Replace(rootFolder, "\\", "/", -1)
-			if rootFolder[len(rootFolder)-1] != '/' {
-				rootFolder += "/"
-			}
-		}
-		rootLinks = c.GlobalString("links")
-		if rootLinks != "" && rootLinks[len(rootLinks)-1] != '/' {
-			rootLinks += "/"
-		}
-		filePath := c.GlobalString("file")
-		if filePath != "" {
-			filePath = strings.Replace(filePath, "\\", "/", -1)
-		}
-		fmt.Println("Welcome to The Gelikon Opera!")
-		fmt.Println("Excel Sortly parser is ready to work\n")
-		fmt.Println("Link prefix is " + rootLinks)
-		fmt.Println("Rootfolder is " + rootFolder)
-		if filePath != "" {
-			fmt.Println("File mod is ON!")
-			readExcel(filePath)
-			fmt.Println("Parsing done!\n")
-			return
-		}
-		fmt.Println("Server started on port " + wPort + "\n")
-		fmt.Println("To start working with parser - just open in your browser (your IP):" + wPort)
-		fmt.Println("For example 127.0.0.1:" + wPort)
-		setupRoutes()
+		err := sp.Cfg.ParseInput(c)
+
+		errFunc = errorWraper(err)
 	}
+
 	app.Run(os.Args)
+
+	return errFunc()
+}
+
+func main() {
+	var (
+		sp = &SortlyParser{}
+	)
+
+	logger, err := NewLogger()
+	if err != nil {
+		panic("cannot init logger")
+	}
+
+	spc := NewSortlyParserConfig(logger)
+	sp = NewSortlyParser(spc)
+
+	logger.Info("Sortly parser is started!")
+
+	err = sp.Cfg.ReadConfig()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		logger.Error(
+			fmt.Sprintf("parse config: %v", err),
+		)
+	}
+
+	errUserInput := sp.GetUserInput()
+
+	if errUserInput != nil && err != nil {
+		logger.Error(
+			fmt.Sprintf("reading user input: %v", errUserInput),
+		)
+		logger.Error(
+			fmt.Sprintf("reading config file: %v", err),
+		)
+		logger.Fatal("Parser config is invalid. Shutdown...")
+	}
+
+	fmt.Println()
+	fmt.Println(`/////////////////////////////////////////`)
+	fmt.Println(`///   Welcome to The Gelikon Opera!   ///`)
+	fmt.Println(`/////////////////////////////////////////`)
+	fmt.Println()
+	fmt.Println(`Excel Sortly parser is ready to work!`)
+	fmt.Println()
+
+	sp.Cfg.Logger.Info(
+		fmt.Sprintf(`Link prefix is "%s"`, sp.Cfg.RootLinks),
+	)
+	sp.Cfg.Logger.Info(
+		fmt.Sprintf(`Rootfolder is "%s"`, sp.Cfg.RootFolder),
+	)
+
+	if sp.Cfg.SaveConfig {
+		sp.Cfg.WriteConfig()
+	}
+
+	if sp.Cfg.FilePath != "" {
+		sp.Cfg.Logger.Info("File mod is ON!")
+		sp.Cfg.Logger.Info(
+			fmt.Sprintf(`File path is "%s"`, sp.Cfg.FilePath),
+		)
+
+		sp.CreateParser().ReadExcel()
+
+		return
+	}
+
+	fmt.Println("\nServer started on port " + sp.Cfg.Port + "\n")
+	fmt.Println("To start working with parser - just open in your browser (your IP):" + sp.Cfg.Port)
+	fmt.Println("For example 127.0.0.1:" + sp.Cfg.Port)
+
+	sp.ServerRun()
 }
